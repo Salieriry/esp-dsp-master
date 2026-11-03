@@ -19,6 +19,11 @@ enum PacketType : uint8_t {
 // aplicar a mesma alteração duas vezes.
 static constexpr uint8_t CONTROL_PROTOCOL_VERSION = 2;
 static constexpr uint8_t PEDAL_STATE_VERSION = 2;
+// O bit 8 identifica a variante que inclui o convolutor de gabinete. Os
+// efeitos 9--11 já ocupam os bits seguintes; manter esse mapa explícito
+// permite que o capturador habilite o teste de IR somente quando a imagem o
+// implementa.
+static constexpr uint16_t EFFECT_CAP_CAB_SIM = 1u << 8;
 static constexpr uint16_t EFFECT_CAP_BITCRUSHER = 1u << 9;
 static constexpr uint16_t EFFECT_CAP_TREMOLO = 1u << 10;
 static constexpr uint16_t EFFECT_CAP_PHASER = 1u << 11;
@@ -32,6 +37,7 @@ enum HostCommand : uint8_t {
     HOST_CMD_PRESET      = 0x15,
     HOST_CMD_GET_METRICS = 0x16,
     HOST_CMD_PING        = 0x17,
+    HOST_CMD_PROFILE     = 0x18,
 };
 
 enum HostResponse : uint8_t {
@@ -39,6 +45,7 @@ enum HostResponse : uint8_t {
     HOST_RSP_CAPS    = 0x81,
     HOST_RSP_STATE   = 0x82,
     HOST_RSP_METRICS = 0x83,
+    HOST_RSP_PROFILE = 0x84,
     HOST_RSP_ERROR   = 0xFF,
 };
 
@@ -101,6 +108,10 @@ struct __attribute__((packed)) HostMetricsPacket {
     uint8_t route;
     uint32_t max_effect_block_us;
     uint32_t dsp_quality_level;
+    uint32_t usb_ring_frames;
+    uint32_t usb_ring_high_water;
+    uint32_t usb_resyncs;
+    uint32_t usb_dropped_frames;
 };
 
 enum PresetAction : uint8_t {

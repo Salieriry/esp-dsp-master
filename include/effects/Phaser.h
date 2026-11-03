@@ -24,6 +24,10 @@ public:
         depth = fminf(fmaxf(depth, 0.0f), 1.0f);
         feedback = fminf(fmaxf(feedback, 0.0f), 0.7f);
         mix = fminf(fmaxf(mix, 0.0f), 1.0f);
+        if (!enabled && wet_ < 0.0005f) {
+            wet_ = 0.0f;
+            return;
+        }
         for (size_t i = 0; i < frames; ++i) {
             wet_ += 0.0015f * ((enabled ? mix : 0.0f) - wet_);
             rate_state_ += 0.002f * (rate - rate_state_);

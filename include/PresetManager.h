@@ -13,6 +13,7 @@ private:
     static constexpr const char* NVS_NAMESPACE = "pedal_storage";
     static constexpr uint32_t MAGIC = 0x5045444c;
     static constexpr uint16_t RECORD_VERSION = 2;
+    static constexpr size_t VERSION_3_STATE_SIZE = sizeof(PedalState) + sizeof(uint8_t);
     static constexpr size_t LEGACY_STATE_SIZE = offsetof(PedalState, bitcrusher_active);
     struct __attribute__((packed)) Record {
         uint32_t magic;
@@ -26,6 +27,13 @@ private:
         uint16_t version;
         uint16_t length;
         uint8_t state[LEGACY_STATE_SIZE];
+        uint32_t crc;
+    };
+    struct __attribute__((packed)) Version3Record {
+        uint32_t magic;
+        uint16_t version;
+        uint16_t length;
+        uint8_t state[VERSION_3_STATE_SIZE];
         uint32_t crc;
     };
     static uint32_t crc32(const uint8_t* data, size_t length) {
@@ -78,7 +86,7 @@ public:
 
         size_t required_size = 0;
         esp_err_t err = nvs_get_blob(handle, key, NULL, &required_size);
-        uint8_t data[sizeof(Record)] = {};
+        uint8_t data[sizeof(Version3Record)] = {};
         if (err == ESP_OK && required_size <= sizeof(data))
             err = nvs_get_blob(handle, key, data, &required_size);
         nvs_close(handle);
@@ -90,6 +98,14 @@ public:
                 record.length != sizeof(PedalState) ||
                 record.crc != crc32(data, offsetof(Record, crc))) return false;
             state = record.state;
+        } else if (err == ESP_OK && required_size == sizeof(Version3Record)) {
+            Version3Record record;
+            memcpy(&record, data, sizeof(record));
+            if (record.magic != MAGIC || record.version != 3 ||
+                record.length != VERSION_3_STATE_SIZE ||
+                record.crc != crc32(data, offsetof(Version3Record, crc))) return false;
+            state = {};
+            memcpy(&state, record.state, sizeof(PedalState));
         } else if (err == ESP_OK && required_size == sizeof(LegacyRecord)) {
             LegacyRecord record;
             memcpy(&record, data, sizeof(record));

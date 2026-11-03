@@ -31,6 +31,10 @@ public:
         rate = fminf(fmaxf(rate, 0.1f), 12.0f);
         depth = fminf(fmaxf(depth, 0.0f), 1.0f);
         mix = fminf(fmaxf(mix, 0.0f), 1.0f);
+        if (!enabled && wet_ < 0.0005f) {
+            wet_ = 0.0f;
+            return;
+        }
         if (shape != shape_) build(shape);
         const float* table = shape_ == 0 ? sine_table_ : triangle_table_;
         for (size_t i = 0; i < frames; ++i) {

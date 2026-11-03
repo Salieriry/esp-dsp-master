@@ -16,35 +16,37 @@
 #define ENABLE_USB_AUDIO     1
 #endif
 
-// O CAB/IR exige mais tempo de CPU do que a combinação completa de efeitos
-// consegue entregar no prazo de 64 amostras nesta revisão da placa. Ele fica
-// desativado por padrão e pode ser reativado em uma variante de firmware com
-// -D ENABLE_CAB_SIM=1 depois de uma medição de carga.
+// PlatformIO compila o perfil CAB por padrão; a macro permanece desativada
+// apenas em compilações externas que não selecionem explicitamente um perfil.
 #ifndef ENABLE_CAB_SIM
 #define ENABLE_CAB_SIM       0
 #endif
 
-#define USB_AUDIO_RING_FRAMES 8192
+#define USB_AUDIO_RING_FRAMES 1024
+#define USB_AUDIO_PRIME_FRAMES 192
+#define USB_AUDIO_LOW_WATER 128
+#define USB_AUDIO_HIGH_WATER 256
+#define USB_AUDIO_RESYNC_WATER 512
 #define USB_CONTROL_RX_BYTES  2048
 #define USB_CONTROL_TX_BYTES  2048
 
 // Mapeamento dos pinos do I2S (Codec ADC/DAC)
-#define ADC_BCK_IO          GPIO_NUM_39
-#define ADC_WS_IO           GPIO_NUM_40
-#define ADC_DIN_IO          GPIO_NUM_41
-#define ADC_MCLK_IO         GPIO_NUM_42
+#define ADC_BCK_IO          GPIO_NUM_7
+#define ADC_WS_IO           GPIO_NUM_16
+#define ADC_DIN_IO          GPIO_NUM_15
+#define ADC_MCLK_IO         GPIO_NUM_17
 
-#define DAC_BCK_IO          GPIO_NUM_47
-#define DAC_WS_IO           GPIO_NUM_48
-#define DAC_DOUT_IO         GPIO_NUM_21
+#define DAC_BCK_IO          GPIO_NUM_9
+#define DAC_WS_IO           GPIO_NUM_11
+#define DAC_DOUT_IO         GPIO_NUM_10
 
 #define SHARED_BCK_IO       ADC_BCK_IO
 #define SHARED_WS_IO        ADC_WS_IO
 
 // UART de controle (comunicação com a Placa B)
 #define UART_PORT_NUM       UART_NUM_1
-#define UART_TX_IO          GPIO_NUM_1
-#define UART_RX_IO          GPIO_NUM_2
+#define UART_TX_IO          GPIO_NUM_4
+#define UART_RX_IO          GPIO_NUM_5
 
 // Inversos multiplicativos pré-computados (elimina divisões de ponto flutuante na FPU)
 static constexpr float INT32_TO_FLOAT = 1.0f / 2147483648.0f;

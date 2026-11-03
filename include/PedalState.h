@@ -72,6 +72,7 @@ struct __attribute__((packed)) PedalState {
     float    phaser_depth;
     float    phaser_feedback;
     float    phaser_mix;
+
 };
 
 static_assert(sizeof(PedalState) == 140, "PedalState wire layout changed; update both boards");

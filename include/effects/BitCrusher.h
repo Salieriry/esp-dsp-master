@@ -23,19 +23,27 @@ public:
 
     void process(float* buffer, size_t frames, uint8_t bits, uint8_t hold, float mix, bool enabled = true) {
         if (bits != bits_ || hold != hold_ || mix != mix_) configure(bits, hold, mix);
+        if (!enabled && wet_ < 0.0005f) {
+            wet_ = 0.0f;
+            return;
+        }
         const float levels = (float)(1u << (bits_ - 1));
         for (size_t i = 0; i < frames; ++i) {
             const float target_wet = enabled ? mix_ : 0.0f;
             wet_ += 0.0015f * (target_wet - wet_);
             const float dry = 1.0f - wet_;
-            const float input = fminf(fmaxf(buffer[i], -1.0f), 1.0f);
+            // O ramo seco deve conservar o nível produzido pelos efeitos
+            // anteriores. Somente a cópia que entra na quantização é limitada
+            // ao intervalo representável pelo bitcrusher.
+            const float dry_input = isfinite(buffer[i]) ? buffer[i] : 0.0f;
+            const float input = fminf(fmaxf(dry_input, -1.0f), 1.0f);
             if (counter_ == 0) {
                 held_ = roundf(input * levels) / levels;
                 counter_ = (uint8_t)(hold_ - 1);
             } else {
                 --counter_;
             }
-            buffer[i] = input * dry + held_ * wet_;
+            buffer[i] = dry_input * dry + held_ * wet_;
         }
     }
 };

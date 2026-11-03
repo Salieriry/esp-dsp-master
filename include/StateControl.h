@@ -3,6 +3,18 @@
 #include "PedalState.h"
 #include "AudioConfig.h"
 
+inline bool valid_integral_parameter(float value, float minimum, float maximum) {
+    return isfinite(value) && value >= minimum && value <= maximum &&
+           floorf(value) == value;
+}
+
+inline bool convert_integral_parameter(float value, float minimum, float maximum,
+                                       uint8_t& output) {
+    if (!valid_integral_parameter(value, minimum, maximum)) return false;
+    output = static_cast<uint8_t>(value);
+    return true;
+}
+
 inline PedalState defaultPedalState() {
     PedalState s = {};
     s.gate_active = 1;
