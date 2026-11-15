@@ -11,7 +11,8 @@ enum PacketType : uint8_t {
     PKT_PRESET_ACTION = 0x04, // Placa B / PC -> Placa A (Salvar / Carregar preset)
     PKT_PRESET_RESULT = 0x05,
     PKT_AUDIO_ROUTE   = 0x06, // Placa A -> Placa B (rota DAC/USB/AMBOS)
-    PKT_TUNER_STATE   = 0x07  // Placa B -> Placa A (silencia as saídas)
+    PKT_TUNER_STATE   = 0x07, // Placa B -> Placa A (silencia as saídas)
+    PKT_PRESET_STATUS = 0x08  // Placa A -> Placa B (origem ativa e edição)
 };
 
 // Protocolo USB CDC da placa A. Os quadros também usam COBS + CRC8 e são
@@ -133,6 +134,10 @@ struct __attribute__((packed)) PresetResultPacket {
     uint8_t action;
     uint8_t slot;
     uint8_t success;
+};
+struct __attribute__((packed)) PresetStatusPacket {
+    uint8_t slot;
+    uint8_t edited;
 };
 struct __attribute__((packed)) AudioRoutePacket {
     uint8_t route;

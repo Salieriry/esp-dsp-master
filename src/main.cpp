@@ -13,8 +13,19 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_err.h"
+#include "esp_memory_utils.h"
 #include "../../common/ProfileMetrics.h"
+#include "esp_cpu.h"
+#include "esp_heap_caps.h"
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR >= 5
+#include "esp_private/esp_clk.h"
+#else
+#include "esp_clk.h"
+#endif
 #include "../../common/ProfileProtocol.h"
+#include "../../common/ProfileCycleCounter.h"
+#include "DmaDriverMetrics.h"
 #include "ProfileStages.h"
 #include "AudioConfig.h"
 
@@ -33,6 +44,10 @@
 #include "CdcMutationCache.h"
 #include "GateThreshold.h"
 #include "irs/ir_index.h"
+
+#ifndef METRICS_FIRMWARE_ID
+#define METRICS_FIRMWARE_ID "not-a-metrics-build"
+#endif
 
 // Motores Modulares de Efeito
 #include "effects/NoiseGate.h"
@@ -76,9 +91,75 @@ static esp_err_t configure_task_watchdog() {
     return err;
 }
 
+// ESP-IDF 5.5 retains FreeRTOS' word-based high-water-mark unit. The wire
+// protocol reports bytes, so convert the returned StackType_t count here.
+#if ENABLE_RESOURCE_METRICS
+static uint32_t task_stack_high_water_bytes(TaskHandle_t task) {
+    if (!task) return 0;
+    const uint64_t bytes = static_cast<uint64_t>(uxTaskGetStackHighWaterMark(task)) *
+                           sizeof(StackType_t);
+    return bytes > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(bytes);
+}
+#endif
+
 // Handles de I2S e Buffer de Streaming USB
 static i2s_chan_handle_t rx_chan = NULL;
 static i2s_chan_handle_t tx_chan = NULL;
+#if ENABLE_RESOURCE_METRICS
+struct DmaCallbackMetrics {
+    uint32_t rx_interrupts = 0;
+    uint32_t tx_interrupts = 0;
+    uint32_t rx_bytes = 0;
+    uint32_t tx_bytes = 0;
+    uint32_t rx_errors = 0;
+    uint32_t tx_errors = 0;
+    uint64_t rx_cycles = 0;
+    uint64_t tx_cycles = 0;
+    uint32_t rx_cycles_max = 0;
+    uint32_t tx_cycles_max = 0;
+};
+static DmaCallbackMetrics dma_callback_metrics;
+static portMUX_TYPE dma_callback_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static bool IRAM_ATTR record_dma_callback(i2s_event_data_t *event, bool tx, bool error) {
+    const uint32_t cycle_start = PROFILE_CYCLE_COUNT();
+    portENTER_CRITICAL_ISR(&dma_callback_lock);
+    if (tx) {
+        ++dma_callback_metrics.tx_interrupts;
+        if (error) ++dma_callback_metrics.tx_errors;
+        else if (event) dma_callback_metrics.tx_bytes += (uint32_t)event->size;
+    } else {
+        ++dma_callback_metrics.rx_interrupts;
+        if (error) ++dma_callback_metrics.rx_errors;
+        else if (event) dma_callback_metrics.rx_bytes += (uint32_t)event->size;
+    }
+    portEXIT_CRITICAL_ISR(&dma_callback_lock);
+    const uint32_t cycles = PROFILE_CYCLE_COUNT() - cycle_start;
+    portENTER_CRITICAL_ISR(&dma_callback_lock);
+    if (tx) {
+        dma_callback_metrics.tx_cycles += cycles;
+        if (cycles > dma_callback_metrics.tx_cycles_max) dma_callback_metrics.tx_cycles_max = cycles;
+    } else {
+        dma_callback_metrics.rx_cycles += cycles;
+        if (cycles > dma_callback_metrics.rx_cycles_max) dma_callback_metrics.rx_cycles_max = cycles;
+    }
+    portEXIT_CRITICAL_ISR(&dma_callback_lock);
+    return false;
+}
+
+static bool IRAM_ATTR on_i2s_rx(i2s_chan_handle_t, i2s_event_data_t *event, void*) {
+    return record_dma_callback(event, false, false);
+}
+static bool IRAM_ATTR on_i2s_rx_overflow(i2s_chan_handle_t, i2s_event_data_t *event, void*) {
+    return record_dma_callback(event, false, true);
+}
+static bool IRAM_ATTR on_i2s_tx(i2s_chan_handle_t, i2s_event_data_t *event, void*) {
+    return record_dma_callback(event, true, false);
+}
+static bool IRAM_ATTR on_i2s_tx_overflow(i2s_chan_handle_t, i2s_event_data_t *event, void*) {
+    return record_dma_callback(event, true, true);
+}
+#endif
 static uint64_t i2s_started_us = 0;
 static std::atomic<uint32_t> audio_io_errors{0};
 static std::atomic<uint32_t> i2s_drift_events{0};
@@ -121,8 +202,87 @@ static std::atomic<TickType_t> usb_last_callback_tick{0};
 // USB CDC and the Placa B UART are independent producers. This mutex makes
 // each state/preset transaction atomic across both control paths.
 static SemaphoreHandle_t control_mutex = nullptr;
+static constexpr uint8_t PRESET_SLOT_UNKNOWN = 0xFF;
+static std::atomic<uint8_t> active_preset_slot{PRESET_SLOT_UNKNOWN};
+static std::atomic<bool> active_preset_edited{false};
+static std::atomic<bool> recovery_tracking_enabled{false};
+static std::atomic<bool> recovery_save_pending{false};
+static std::atomic<bool> preset_status_pending{false};
+static std::atomic<uint32_t> recovery_generation{0};
+static std::atomic<TickType_t> recovery_last_change_tick{0};
+
+static void request_recovery_save() {
+    if (!recovery_tracking_enabled.load(std::memory_order_acquire)) return;
+    recovery_generation.fetch_add(1, std::memory_order_acq_rel);
+    recovery_last_change_tick.store(xTaskGetTickCount(), std::memory_order_release);
+    recovery_save_pending.store(true, std::memory_order_release);
+}
+
+static void mark_active_preset_edited() {
+    if (!recovery_tracking_enabled.load(std::memory_order_acquire)) return;
+    active_preset_edited.store(true, std::memory_order_release);
+    preset_status_pending.store(true, std::memory_order_release);
+    request_recovery_save();
+}
+
+static void mark_active_preset_origin(uint8_t slot) {
+    active_preset_slot.store(slot, std::memory_order_release);
+    active_preset_edited.store(false, std::memory_order_release);
+    preset_status_pending.store(true, std::memory_order_release);
+    request_recovery_save();
+}
 
 static profile_metrics::Recorder<AP_STAGE_COUNT> audio_profiler;
+#if ENABLE_RESOURCE_METRICS
+static std::atomic<uint32_t> audio_task_buffer_locations{0};
+
+static __attribute__((noinline)) uint32_t set_buffer_location(
+        uint32_t flags, uint8_t slot, const void *pointer) {
+    if (!pointer) return flags;
+    uint8_t location = profile_protocol::BUFFER_LOCATION_OTHER;
+    if (esp_ptr_internal(pointer)) location = profile_protocol::BUFFER_LOCATION_INTERNAL_SRAM;
+    else if (esp_ptr_external_ram(pointer)) location = profile_protocol::BUFFER_LOCATION_PSRAM;
+    return flags | (static_cast<uint32_t>(location) << (slot * 2));
+}
+#endif
+#if ENABLE_RESOURCE_METRICS
+static uint32_t cycle_marker_min_cycles = 0;
+static uint32_t cycle_marker_mean_cycles = 0;
+static uint32_t cycle_marker_max_cycles = 0;
+static bool cycle_marker_cost_ready = false;
+
+static void measure_cycle_marker_cost() {
+    if (cycle_marker_cost_ready) return;
+    uint64_t total = 0;
+    uint32_t minimum = UINT32_MAX;
+    uint32_t maximum = 0;
+    uint32_t valid = 0;
+    for (unsigned i = 0; i < 256; ++i) {
+        const int start_core = PROFILE_CORE_ID();
+        const uint32_t start = PROFILE_CYCLE_COUNT();
+        const int64_t start_us = esp_timer_get_time();
+        const uint32_t start_hz = (uint32_t)esp_clk_cpu_freq();
+        const int64_t end_us = esp_timer_get_time();
+        const uint32_t end = PROFILE_CYCLE_COUNT();
+        const uint32_t end_hz = (uint32_t)esp_clk_cpu_freq();
+        const int end_core = PROFILE_CORE_ID();
+        const uint64_t elapsed_us = (uint64_t)(end_us - start_us);
+        if (start_core != end_core || start_hz == 0 || start_hz != end_hz ||
+            elapsed_us >= ((uint64_t)UINT32_MAX * 1000000ULL) / start_hz) continue;
+        const uint32_t cycles = end - start;
+        if (cycles < minimum) minimum = cycles;
+        if (cycles > maximum) maximum = cycles;
+        total += cycles;
+        ++valid;
+    }
+    if (valid) {
+        cycle_marker_min_cycles = minimum;
+        cycle_marker_mean_cycles = (uint32_t)(total / valid);
+        cycle_marker_max_cycles = maximum;
+    }
+    cycle_marker_cost_ready = true;
+}
+#endif
 
 static CdcMutationCache usb_mutation_cache;
 #if ENABLE_PROFILING
@@ -132,14 +292,40 @@ static std::atomic<uint32_t> profile_timer_pair_us{0};
 #endif
 
 #if ENABLE_PROFILING
+#define PROFILE_START(name) \
+    const int64_t name##_t0 = esp_timer_get_time(); \
+    const uint32_t name##_c0 = PROFILE_CYCLE_COUNT(); \
+    const int name##_core = PROFILE_CORE_ID(); \
+    const uint32_t name##_cpu_hz = (uint32_t)esp_clk_cpu_freq()
+#define PROFILE_FINISH(rec, stage, mode, samples, name) do { \
+    const int64_t _profile_t1 = esp_timer_get_time(); \
+    const uint32_t _profile_c1 = PROFILE_CYCLE_COUNT(); \
+    const uint32_t _profile_cpu_hz_end = (uint32_t)esp_clk_cpu_freq(); \
+    const uint64_t _profile_elapsed_us = (uint64_t)(_profile_t1 - name##_t0); \
+    const uint64_t _profile_wrap_us = name##_cpu_hz ? \
+        ((uint64_t)UINT32_MAX * 1000000ULL) / name##_cpu_hz : 0; \
+    const int _profile_core_end = PROFILE_CORE_ID(); \
+    const uint8_t _profile_cycle_reason = _profile_core_end != name##_core ? \
+        profile_metrics::CYCLE_CORE_CHANGED : \
+        (name##_cpu_hz != _profile_cpu_hz_end || !name##_cpu_hz ? \
+         profile_metrics::CYCLE_FREQUENCY_CHANGED : \
+         (_profile_elapsed_us >= _profile_wrap_us ? profile_metrics::CYCLE_WRAP_AMBIGUOUS : 0)); \
+    const bool _profile_cycle_valid = _profile_cycle_reason == 0; \
+    (rec).record((stage), _profile_elapsed_us, \
+                 (samples), (mode), (uint32_t)(_profile_c1 - name##_c0), \
+                 _profile_cycle_valid, _profile_cycle_reason, \
+                 name##_core >= 0 ? (uint8_t)name##_core : UINT8_MAX, \
+                 name##_cpu_hz); \
+} while (0)
 #define PROFILE_EXEC(rec, stage, mode, samples, ...) do { \
-    const int64_t _profile_t0 = esp_timer_get_time(); \
+    PROFILE_START(_profile_exec); \
     __VA_ARGS__; \
-    (rec).record((stage), (uint64_t)(esp_timer_get_time() - _profile_t0), \
-                 (samples), (mode)); \
+    PROFILE_FINISH(rec, stage, mode, samples, _profile_exec); \
 } while (0)
 #define PROFILE_COUNT(rec, stage, mode) (rec).count((stage), (mode))
 #else
+#define PROFILE_START(name) do { } while (0)
+#define PROFILE_FINISH(rec, stage, mode, samples, name) do { } while (0)
 #define PROFILE_EXEC(rec, stage, mode, samples, ...) do { __VA_ARGS__; } while (0)
 #define PROFILE_COUNT(rec, stage, mode) do { } while (0)
 #endif
@@ -317,6 +503,7 @@ static void publish_state(const PedalState& value) {
     portENTER_CRITICAL(&state_lock);
     memcpy(&dsp_state, &sanitized, sizeof(sanitized));
     portEXIT_CRITICAL(&state_lock);
+    mark_active_preset_edited();
 }
 
 // Fator dinâmico de atenuação alimentado pela IA da Placa B
@@ -377,6 +564,22 @@ static esp_err_t init_i2s_system(void) {
     std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     I2S_INIT_OR_FAIL(i2s_channel_init_std_mode(rx_chan, &std_cfg));
     I2S_INIT_OR_FAIL(i2s_channel_init_std_mode(tx_chan, &std_cfg));
+#if ENABLE_RESOURCE_METRICS
+    const i2s_event_callbacks_t rx_callbacks = {
+        .on_recv = on_i2s_rx,
+        .on_recv_q_ovf = on_i2s_rx_overflow,
+        .on_sent = NULL,
+        .on_send_q_ovf = NULL,
+    };
+    const i2s_event_callbacks_t tx_callbacks = {
+        .on_recv = NULL,
+        .on_recv_q_ovf = NULL,
+        .on_sent = on_i2s_tx,
+        .on_send_q_ovf = on_i2s_tx_overflow,
+    };
+    I2S_INIT_OR_FAIL(i2s_channel_register_event_callback(rx_chan, &rx_callbacks, nullptr));
+    I2S_INIT_OR_FAIL(i2s_channel_register_event_callback(tx_chan, &tx_callbacks, nullptr));
+#endif
 #else
     i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     rx_chan_cfg.dma_desc_num = DMA_DESC_NUM;
@@ -394,6 +597,15 @@ static esp_err_t init_i2s_system(void) {
     };
     rx_std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     I2S_INIT_OR_FAIL(i2s_channel_init_std_mode(rx_chan, &rx_std_cfg));
+#if ENABLE_RESOURCE_METRICS
+    const i2s_event_callbacks_t rx_callbacks = {
+        .on_recv = on_i2s_rx,
+        .on_recv_q_ovf = on_i2s_rx_overflow,
+        .on_sent = NULL,
+        .on_send_q_ovf = NULL,
+    };
+    I2S_INIT_OR_FAIL(i2s_channel_register_event_callback(rx_chan, &rx_callbacks, nullptr));
+#endif
 
     i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
     tx_chan_cfg.dma_desc_num = DMA_DESC_NUM;
@@ -410,6 +622,15 @@ static esp_err_t init_i2s_system(void) {
         },
     };
     I2S_INIT_OR_FAIL(i2s_channel_init_std_mode(tx_chan, &tx_std_cfg));
+#if ENABLE_RESOURCE_METRICS
+    const i2s_event_callbacks_t tx_callbacks = {
+        .on_recv = NULL,
+        .on_recv_q_ovf = NULL,
+        .on_sent = on_i2s_tx,
+        .on_send_q_ovf = on_i2s_tx_overflow,
+    };
+    I2S_INIT_OR_FAIL(i2s_channel_register_event_callback(tx_chan, &tx_callbacks, nullptr));
+#endif
 #endif
     I2S_INIT_OR_FAIL(i2s_channel_enable(rx_chan));
     I2S_INIT_OR_FAIL(i2s_channel_enable(tx_chan));
@@ -451,6 +672,20 @@ static void send_preset_result(uint8_t action, uint8_t slot, bool success) {
     uint8_t payload[] = {PKT_PRESET_RESULT, action, slot, (uint8_t)success};
     uint8_t frame[sizeof(payload) + 4];
     size_t count = encode_packet(payload, sizeof(payload), frame);
+    frame[count] = 0;
+    uart_write_bytes(UART_PORT_NUM, frame, count + 1);
+}
+
+static void send_preset_status() {
+    ControlGuard guard;
+    PresetStatusPacket status{
+        active_preset_slot.load(std::memory_order_acquire),
+        static_cast<uint8_t>(active_preset_edited.load(std::memory_order_acquire))
+    };
+    uint8_t payload[1 + sizeof(status)] = {PKT_PRESET_STATUS};
+    memcpy(&payload[1], &status, sizeof(status));
+    uint8_t frame[sizeof(payload) + 4];
+    const size_t count = encode_packet(payload, sizeof(payload), frame);
     frame[count] = 0;
     uart_write_bytes(UART_PORT_NUM, frame, count + 1);
 }
@@ -781,6 +1016,138 @@ static void usb_process_profile_request(uint16_t sequence, const uint8_t *payloa
         return;
     }
 
+    if (request.operation == REQUEST_EXTENDED_CAPS) {
+#if ENABLE_RESOURCE_METRICS
+        ExtendedCapabilities ext{};
+        ext.header = header;
+        ext.feature_flags = FEATURE_CYCLE_PAGES | FEATURE_RESOURCE_SNAPSHOT |
+                            FEATURE_DMA_EVENT_CALLBACKS | FEATURE_DMA_DRIVER_HOOKS;
+        strncpy(ext.firmware_id, METRICS_FIRMWARE_ID, sizeof(ext.firmware_id) - 1);
+        usb_send_profile_response(sequence, &ext, sizeof(ext));
+#else
+        header.status = STATUS_UNAVAILABLE;
+        usb_send_profile_response(sequence, &header, sizeof(header));
+#endif
+        return;
+    }
+
+#if ENABLE_RESOURCE_METRICS
+    if (request.operation == REQUEST_RESOURCE_SNAPSHOT) {
+        ResourceSnapshot metrics{};
+        metrics.header = header;
+        metrics.cpu_frequency_hz = esp_clk_cpu_freq();
+        measure_cycle_marker_cost();
+        metrics.internal_free_bytes = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        metrics.internal_min_free_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        metrics.internal_largest_block_bytes = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        metrics.psram_free_bytes = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        metrics.psram_min_free_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        metrics.psram_largest_block_bytes = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        TaskHandle_t audio_task = xTaskGetHandle("dsp_task");
+        metrics.task_stack_high_water_bytes = task_stack_high_water_bytes(audio_task);
+        TaskHandle_t comm_task = xTaskGetHandle("comm_task");
+        TaskHandle_t usb_task = xTaskGetHandle("usb_ctrl");
+        metrics.ui_stack_high_water_bytes = task_stack_high_water_bytes(comm_task);
+        metrics.capture_stack_high_water_bytes = task_stack_high_water_bytes(usb_task);
+        metrics.recorder_bytes = sizeof(audio_profiler);
+        metrics.raw_i2s_buffer_bytes = sizeof(int32_t) * BUFFER_SAMPLES;
+        metrics.audio_frame_buffer_bytes = sizeof(int32_t) * DMA_FRAME_NUM +
+                                           sizeof(float) * DMA_FRAME_NUM;
+#if ENABLE_CAB_SIM && !LATENCY_TEST_MODE
+        metrics.audio_frame_buffer_bytes += sizeof(float) * DMA_FRAME_NUM;
+#endif
+        metrics.usb_ring_bytes = sizeof(usb_pcm_ring) + sizeof(usb_control_ring);
+        metrics.buffer_location_flags = audio_task_buffer_locations.load(std::memory_order_acquire);
+        metrics.buffer_location_flags = set_buffer_location(metrics.buffer_location_flags,
+            profile_protocol::BUFFER_SLOT_PROFILER, &audio_profiler);
+        metrics.buffer_location_flags = set_buffer_location(metrics.buffer_location_flags,
+            profile_protocol::BUFFER_SLOT_USB_RING, &usb_pcm_ring);
+        metrics.buffer_location_flags = set_buffer_location(metrics.buffer_location_flags,
+            profile_protocol::BUFFER_SLOT_APP_INSTRUMENTATION, &dma_callback_metrics);
+        metrics.app_instrumentation_bytes = sizeof(dma_callback_metrics) + sizeof(dma_callback_lock) +
+            sizeof(audio_task_buffer_locations) + sizeof(cycle_marker_min_cycles) +
+            sizeof(cycle_marker_mean_cycles) + sizeof(cycle_marker_max_cycles) +
+            sizeof(cycle_marker_cost_ready);
+        metrics.cycle_marker_min_cycles = cycle_marker_min_cycles;
+        metrics.cycle_marker_mean_cycles = cycle_marker_mean_cycles;
+        metrics.cycle_marker_max_cycles = cycle_marker_max_cycles;
+        metrics.memory_valid = 1;
+        portENTER_CRITICAL(&dma_callback_lock);
+        metrics.dma_rx_interrupts = dma_callback_metrics.rx_interrupts;
+        metrics.dma_tx_interrupts = dma_callback_metrics.tx_interrupts;
+        metrics.dma_rx_bytes = dma_callback_metrics.rx_bytes;
+        metrics.dma_tx_bytes = dma_callback_metrics.tx_bytes;
+        metrics.dma_rx_errors = dma_callback_metrics.rx_errors;
+        metrics.dma_tx_errors = dma_callback_metrics.tx_errors;
+        metrics.dma_rx_cycles_total = dma_callback_metrics.rx_cycles;
+        metrics.dma_tx_cycles_total = dma_callback_metrics.tx_cycles;
+        metrics.dma_rx_cycles_max = dma_callback_metrics.rx_cycles_max;
+        metrics.dma_tx_cycles_max = dma_callback_metrics.tx_cycles_max;
+        portEXIT_CRITICAL(&dma_callback_lock);
+        metrics.dma_events_valid = 1;
+        i2s_chan_info_t rx_info{};
+        i2s_chan_info_t tx_info{};
+        const bool rx_info_valid = rx_chan && i2s_channel_get_info(rx_chan, &rx_info) == ESP_OK;
+        const bool tx_info_valid = tx_chan && i2s_channel_get_info(tx_chan, &tx_info) == ESP_OK;
+        if (rx_info_valid) metrics.dma_buffer_bytes += rx_info.total_dma_buf_size;
+        if (tx_info_valid) metrics.dma_buffer_bytes += tx_info.total_dma_buf_size;
+        DmaDriverMetrics i2s_dma{};
+        DmaDriverMetrics gdma_dma{};
+        i2s_driver_metrics_snapshot(&i2s_dma);
+        gdma_driver_metrics_snapshot(&gdma_dma);
+        metrics.dma_buffer_bytes = i2s_dma.rx_buffer_bytes + i2s_dma.tx_buffer_bytes;
+        metrics.dma_descriptor_bytes = i2s_dma.rx_descriptor_bytes + i2s_dma.tx_descriptor_bytes;
+        metrics.dma_memory_valid = rx_info_valid && tx_info_valid && i2s_dma.memory_valid;
+        metrics.dma_valid = metrics.dma_events_valid && metrics.dma_memory_valid &&
+                            i2s_dma.timing_valid && gdma_dma.events_valid && gdma_dma.timing_valid;
+        usb_send_profile_response(sequence, &metrics, sizeof(metrics));
+        return;
+    }
+
+    if (request.operation == REQUEST_DMA_DRIVER_SNAPSHOT) {
+        DmaDriverMetrics i2s_dma{};
+        DmaDriverMetrics gdma_dma{};
+        i2s_driver_metrics_snapshot(&i2s_dma);
+        // Pair cumulative I2S byte counts with the MCU high-resolution timer.
+        const uint64_t counters_at_us = (uint64_t)esp_timer_get_time();
+        gdma_driver_metrics_snapshot(&gdma_dma);
+        DmaDriverSnapshot dma{};
+        dma.header = header;
+        dma.header.boundary_us = counters_at_us;
+        dma.rx_interrupts = gdma_dma.rx_interrupts;
+        dma.tx_interrupts = gdma_dma.tx_interrupts;
+        dma.rx_bytes = i2s_dma.rx_bytes;
+        dma.tx_bytes = i2s_dma.tx_bytes;
+        dma.rx_errors = i2s_dma.rx_errors + gdma_dma.rx_errors;
+        dma.tx_errors = i2s_dma.tx_errors + gdma_dma.tx_errors;
+        dma.rx_buffer_bytes = i2s_dma.rx_buffer_bytes;
+        dma.tx_buffer_bytes = i2s_dma.tx_buffer_bytes;
+        dma.rx_descriptor_bytes = i2s_dma.rx_descriptor_bytes;
+        dma.tx_descriptor_bytes = i2s_dma.tx_descriptor_bytes;
+        dma.instrumentation_bytes = i2s_driver_metrics_storage_bytes() +
+                                    gdma_driver_metrics_storage_bytes();
+        dma.rx_isr_cycles_total = gdma_dma.rx_isr_cycles_total;
+        dma.tx_isr_cycles_total = gdma_dma.tx_isr_cycles_total;
+        dma.rx_isr_cycles_max = gdma_dma.rx_isr_cycles_max;
+        dma.tx_isr_cycles_max = gdma_dma.tx_isr_cycles_max;
+        dma.rx_callback_cycles_total = i2s_dma.rx_callback_cycles_total;
+        dma.tx_callback_cycles_total = i2s_dma.tx_callback_cycles_total;
+        dma.rx_callback_cycles_max = i2s_dma.rx_callback_cycles_max;
+        dma.tx_callback_cycles_max = i2s_dma.tx_callback_cycles_max;
+        dma.rx_copy_cycles_total = i2s_dma.rx_copy_cycles_total;
+        dma.tx_copy_cycles_total = i2s_dma.tx_copy_cycles_total;
+        dma.rx_copy_cycles_max = i2s_dma.rx_copy_cycles_max;
+        dma.tx_copy_cycles_max = i2s_dma.tx_copy_cycles_max;
+        dma.rx_wait_us = i2s_dma.rx_wait_us;
+        dma.tx_wait_us = i2s_dma.tx_wait_us;
+        dma.events_valid = i2s_dma.events_valid && gdma_dma.events_valid;
+        dma.memory_valid = i2s_dma.memory_valid;
+        dma.timing_valid = i2s_dma.timing_valid && gdma_dma.timing_valid;
+        usb_send_profile_response(sequence, &dma, sizeof(dma));
+        return;
+    }
+#endif
+
 #if !ENABLE_PROFILING
     header.status = STATUS_DISABLED;
     usb_send_profile_response(sequence, &header, sizeof(header));
@@ -791,7 +1158,17 @@ static void usb_process_profile_request(uint16_t sequence, const uint8_t *payloa
         if (request.session_id == 0) header.status = STATUS_BAD_REQUEST;
         else {
             profile_snapshot_request.store(0, std::memory_order_release);
-            profile_session_request.store(request.session_id, std::memory_order_release);
+            const uint32_t previous_session = profile_session_request.exchange(
+                request.session_id, std::memory_order_acq_rel);
+#if ENABLE_RESOURCE_METRICS
+            if (previous_session != request.session_id) {
+                portENTER_CRITICAL(&dma_callback_lock);
+                dma_callback_metrics = {};
+                portEXIT_CRITICAL(&dma_callback_lock);
+                i2s_driver_metrics_reset();
+                gdma_driver_metrics_reset();
+            }
+#endif
             header.status = audio_profiler.acknowledged_session() == request.session_id
                 ? STATUS_OK : STATUS_PENDING;
         }
@@ -873,6 +1250,37 @@ static void usb_process_profile_request(uint16_t sequence, const uint8_t *payloa
         page.histogram_overflow = stats.histogram_overflow;
         memcpy(page.histogram, stats.histogram + request.histogram_offset,
                page.histogram_count * sizeof(uint16_t));
+        usb_send_profile_response(sequence, &page, sizeof(page));
+        return;
+    }
+
+    if (request.operation == REQUEST_CYCLE_PAGE) {
+        const profile_metrics::Bank<AP_STAGE_COUNT> *bank =
+            audio_profiler.published_bank(request.snapshot_id);
+        if (!bank || request.stage_id >= AP_STAGE_COUNT) {
+            header.status = bank ? STATUS_BAD_REQUEST : STATUS_STALE_SNAPSHOT;
+            usb_send_profile_response(sequence, &header, sizeof(header));
+            return;
+        }
+        const auto &stats = bank->stages[request.stage_id];
+        CyclePage page{};
+        page.header = header;
+        page.header.boundary_us = bank->boundary_us;
+        page.stage_id = request.stage_id;
+        page.stage_count = AP_STAGE_COUNT;
+        page.calls = stats.calls;
+        page.valid_calls = stats.cycle_calls;
+        page.cycles_total = stats.cycles_total;
+        page.cycles_min = stats.cycle_calls ? stats.cycles_min : 0;
+        page.cycles_max = stats.cycles_max;
+        page.invalid_calls = stats.cycle_invalid;
+        page.not_instrumented_calls = stats.cycle_not_instrumented;
+        page.core_changed_calls = stats.cycle_core_changed;
+        page.frequency_changed_calls = stats.cycle_frequency_changed;
+        page.wrap_ambiguous_calls = stats.cycle_wrap_ambiguous;
+        page.cycle_core_id = stats.cycle_core_id;
+        page.cycle_metadata_flags = stats.cycle_metadata_flags;
+        page.cycle_cpu_frequency_hz = stats.cycle_cpu_frequency_hz;
         usb_send_profile_response(sequence, &page, sizeof(page));
         return;
     }
@@ -1002,12 +1410,14 @@ static void usb_process_frame(const uint8_t *raw, size_t raw_len) {
                 ControlGuard guard;
                 if (command.action == PRESET_SAVE) {
                     ok = PresetManager::savePreset(command.slot, state_snapshot());
+                    if (ok) mark_active_preset_origin(command.slot);
                 } else if (command.action == PRESET_LOAD) {
                     PedalState loaded{};
                     const bool found = PresetManager::loadPreset(command.slot, loaded);
                     normalize_state_for_build(loaded);
                     if (found && validPedalState(loaded, TOTAL_IR_PRESETS)) {
                         publish_state(loaded);
+                        mark_active_preset_origin(command.slot);
                         broadcast_pedal_state(&loaded);
                         ok = true;
                     }
@@ -1270,8 +1680,6 @@ static void full_duplex_comm_task(void *args) {
     uint8_t rx_raw[512];
     uint8_t decoded[512];
     int rx_pos = 0;
-    bool autosave_pending = false;
-    TickType_t last_edit_tick = 0;
     TickType_t last_state_sync = xTaskGetTickCount();
 
     ESP_ERROR_CHECK(esp_task_wdt_add(nullptr));
@@ -1282,6 +1690,7 @@ static void full_duplex_comm_task(void *args) {
     PedalState initial = state_snapshot();
     broadcast_pedal_state(&initial);
     broadcast_audio_route(audio_route.load(std::memory_order_acquire));
+    send_preset_status();
     last_state_sync = xTaskGetTickCount();
 
     while (1) {
@@ -1318,10 +1727,7 @@ static void full_duplex_comm_task(void *args) {
                                 if (dec_len == 1 + sizeof(UiParamIncPacket)) {
                                     UiParamIncPacket pkt;
                                     memcpy(&pkt, data, sizeof(UiParamIncPacket));
-                                    if (apply_param_increment(pkt.effect_idx, pkt.param_idx, pkt.delta)) {
-                                        autosave_pending = true;
-                                        last_edit_tick = xTaskGetTickCount();
-                                    }
+                                    (void)apply_param_increment(pkt.effect_idx, pkt.param_idx, pkt.delta);
                                 }
                                 break;
                             }
@@ -1335,12 +1741,14 @@ static void full_duplex_comm_task(void *args) {
                                         if (pkt.action == PRESET_SAVE) {
                                             PedalState saved = state_snapshot();
                                             ok = PresetManager::savePreset(pkt.slot, saved);
+                                            if (ok) mark_active_preset_origin(pkt.slot);
                                         } else if (pkt.action == PRESET_LOAD) {
                                             PedalState loaded{};
                                             const bool found = PresetManager::loadPreset(pkt.slot, loaded);
                                             normalize_state_for_build(loaded);
                                             if (found && validPedalState(loaded, TOTAL_IR_PRESETS)) {
                                                 publish_state(loaded);
+                                                mark_active_preset_origin(pkt.slot);
                                                 broadcast_pedal_state(&loaded);
                                                 ok = true;
                                             }
@@ -1358,19 +1766,33 @@ static void full_duplex_comm_task(void *args) {
                 if (rx_pos < sizeof(rx_raw)) rx_raw[rx_pos++] = byte;
             }
         }
-        if (autosave_pending && xTaskGetTickCount() - last_edit_tick > pdMS_TO_TICKS(2000)) {
-            PedalState saved = state_snapshot();
-            if (PresetManager::savePreset(0, saved)) autosave_pending = false;
+        const TickType_t now = xTaskGetTickCount();
+        if (recovery_save_pending.load(std::memory_order_acquire) &&
+            now - recovery_last_change_tick.load(std::memory_order_acquire) >=
+                pdMS_TO_TICKS(2000)) {
+            const uint32_t generation = recovery_generation.load(std::memory_order_acquire);
+            bool saved = false;
+            {
+                ControlGuard guard;
+                saved = PresetManager::saveRecovery(
+                    state_snapshot(), active_preset_slot.load(std::memory_order_acquire),
+                    active_preset_edited.load(std::memory_order_acquire));
+            }
+            if (saved && generation == recovery_generation.load(std::memory_order_acquire))
+                recovery_save_pending.store(false, std::memory_order_release);
+        }
+        if (preset_status_pending.exchange(false, std::memory_order_acq_rel)) {
+            send_preset_status();
         }
 
         // Reenvia o espelho em intervalos curtos para cobrir a inicialização
         // tardia ou uma perda isolada na UART. O quadro é pequeno frente a
         // 460.800 bps e não altera o fluxo de áudio.
-        const TickType_t now = xTaskGetTickCount();
         if (now - last_state_sync >= pdMS_TO_TICKS(500)) {
             PedalState current = state_snapshot();
             broadcast_pedal_state(&current);
             broadcast_audio_route(audio_route.load(std::memory_order_acquire));
+            send_preset_status();
             last_state_sync = now;
         }
         (void)esp_task_wdt_reset();
@@ -1447,18 +1869,32 @@ static void debug_print_task(void *args) {
 // CORE 1: KERNEL DE ÁUDIO EM TEMPO REAL (DSP COMPLETO)
 // -------------------------------------------------------------
 static void audio_processing_task(void *args) {
+#if ENABLE_RESOURCE_METRICS
+    alignas(16) int32_t audio_buffer[BUFFER_SAMPLES] = {};
+#else
     alignas(16) int32_t audio_buffer[BUFFER_SAMPLES];
+#endif
     alignas(16) int32_t usb_block[DMA_FRAME_NUM];
     alignas(16) float mono_samples[DMA_FRAME_NUM];
-#if ENABLE_CAB_SIM
+#if ENABLE_CAB_SIM && !LATENCY_TEST_MODE
     alignas(16) float ir_output[DMA_FRAME_NUM];
+#endif
+#if ENABLE_RESOURCE_METRICS
+    uint32_t task_buffer_locations = 0;
+    task_buffer_locations = set_buffer_location(task_buffer_locations,
+        profile_protocol::BUFFER_SLOT_RAW_I2S, audio_buffer);
+    task_buffer_locations = set_buffer_location(task_buffer_locations,
+        profile_protocol::BUFFER_SLOT_AUDIO_FRAME, mono_samples);
+    audio_task_buffer_locations.store(task_buffer_locations, std::memory_order_release);
 #endif
 
     size_t bytes_read = 0, bytes_written = 0;
     uint8_t consecutive_io_errors = 0;
+#if !LATENCY_TEST_MODE
         bool eq_configured = false;
         float eq_gains[4] = {NAN, NAN, NAN, NAN};
-#if ENABLE_CAB_SIM
+#endif
+#if ENABLE_CAB_SIM && !LATENCY_TEST_MODE
         bool cab_was_active = false;
         uint8_t cab_last_ir = 0;
         uint8_t cab_requested_ir = 0;
@@ -1468,7 +1904,9 @@ static void audio_processing_task(void *args) {
         uint8_t shed_level = 0;
         uint8_t slow_streak = 0;
         uint16_t recovery_streak = 0;
+#if !LATENCY_TEST_MODE
         float tuner_output_gain = 1.0f;
+#endif
 
     ESP_ERROR_CHECK(esp_task_wdt_add(nullptr));
 #if ENABLE_WDT_TEST_HANG
@@ -1489,14 +1927,13 @@ static void audio_processing_task(void *args) {
             consecutive_io_errors = 0;
         }
 #if ENABLE_PROFILING
-        const int64_t rx_wait_started = esp_timer_get_time();
+        PROFILE_START(rx_wait_profile);
 #endif
         bytes_read = 0;
         const esp_err_t read_status = i2s_channel_read(rx_chan, audio_buffer, sizeof(audio_buffer), &bytes_read, 100);
 #if ENABLE_PROFILING
-        audio_profiler.record(AP_RX_WAIT,
-            (uint64_t)(esp_timer_get_time() - rx_wait_started), bytes_read / 8,
-            profile_metrics::MODE_ACTIVE);
+        PROFILE_FINISH(audio_profiler, AP_RX_WAIT, profile_metrics::MODE_ACTIVE,
+                       bytes_read / 8, rx_wait_profile);
 #endif
         if (read_status != ESP_OK || bytes_read == 0 || bytes_read % 8 != 0) {
             audio_io_errors.fetch_add(1);
@@ -1516,13 +1953,13 @@ static void audio_processing_task(void *args) {
         }
         int64_t processing_started = esp_timer_get_time();
 #if ENABLE_PROFILING
-        const int64_t housekeeping_started = esp_timer_get_time();
+        PROFILE_START(block_total_profile);
+        PROFILE_START(housekeeping_profile);
         audio_profiler.reset_request(profile_session_request.load(std::memory_order_acquire));
         audio_profiler.snapshot_request(profile_snapshot_request.load(std::memory_order_acquire));
         audio_profiler.service((uint64_t)esp_timer_get_time());
-        audio_profiler.record(AP_HOUSEKEEPING,
-            (uint64_t)(esp_timer_get_time() - housekeeping_started), 0,
-            profile_metrics::MODE_ACTIVE);
+        PROFILE_FINISH(audio_profiler, AP_HOUSEKEEPING, profile_metrics::MODE_ACTIVE,
+                       0, housekeeping_profile);
 #endif
         const int frames = bytes_read / 8;
         if (frames != DMA_FRAME_NUM) i2s_drift_events.fetch_add(1, std::memory_order_relaxed);
@@ -1534,7 +1971,7 @@ static void audio_processing_task(void *args) {
         snapshot = state_snapshot();
 #endif
         PedalState* state = &snapshot;
-#if ENABLE_CAB_SIM
+#if ENABLE_CAB_SIM && !LATENCY_TEST_MODE
         const uint8_t requested_ir = (state->cab_index < TOTAL_IR_PRESETS) ? state->cab_index : 0;
         // Uma sobrecarga persistente não deve ficar alternando o CAB a cada
         // poucos blocos, pois isso produziria uma modulação audível. Depois de
@@ -1566,6 +2003,24 @@ static void audio_processing_task(void *args) {
         });
 #endif
 
+#if LATENCY_TEST_MODE
+        // Ignora o estado dos efeitos e o comando de gate da placa B. Os
+        // valores originais continuam armazenados e sincronizados normalmente.
+        PROFILE_COUNT(audio_profiler, AP_GATE, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_COMPRESSOR, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_AUTOWAH, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_OVERDRIVE, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_BITCRUSHER, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_EQ_CONFIG, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_EQ_PROCESS, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_PHASER, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_CHORUS, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_TREMOLO, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_DELAY, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_REVERB, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_CAB_RESET, profile_metrics::MODE_SKIPPED);
+        PROFILE_COUNT(audio_profiler, AP_CAB_PROCESS, profile_metrics::MODE_SKIPPED);
+#else
         // 2. Noise Gate Híbrido (Envelope interno modulado pela IA externa)
         if (state->gate_active) {
             TickType_t age = xTaskGetTickCount() - last_ai_tick.load();
@@ -1767,12 +2222,15 @@ static void audio_processing_task(void *args) {
 #else
             if (!cab_was_active || cab_last_ir != ir_idx) cab_sim.reset();
 #endif
+#if ENABLE_PROFILING
+            PROFILE_START(cab_process_profile);
+#endif
             int64_t cab_started = esp_timer_get_time();
             cab_sim.process(mono_samples, ir_output, frames, ir_idx);
             const uint32_t cab_processing_us = (uint32_t)(esp_timer_get_time() - cab_started);
 #if ENABLE_PROFILING
-            audio_profiler.record(AP_CAB_PROCESS, cab_processing_us, frames,
-                                  profile_metrics::MODE_ACTIVE);
+            PROFILE_FINISH(audio_profiler, AP_CAB_PROCESS, profile_metrics::MODE_ACTIVE,
+                           frames, cab_process_profile);
 #endif
             last_cab_block_us.store(cab_processing_us, std::memory_order_relaxed);
             update_max(max_cab_block_us, cab_processing_us);
@@ -1803,9 +2261,11 @@ static void audio_processing_task(void *args) {
         // O caminho é compilado fora da imagem padrão. Os campos legados do
         // estado já foram normalizados para cab_active=0.
 #endif
+#endif // LATENCY_TEST_MODE
 
         // 11. Clamping, cópia PCM de 24 bits para USB e saída estéreo do DAC.
         const uint8_t route = audio_route.load(std::memory_order_acquire);
+#if !LATENCY_TEST_MODE
         const TickType_t tuner_state_age =
             xTaskGetTickCount() - last_tuner_state_tick.load(std::memory_order_acquire);
         const bool tuner_silent = tuner_mute.load(std::memory_order_acquire) &&
@@ -1815,6 +2275,7 @@ static void audio_processing_task(void *args) {
         // afinador. O mute continua valendo para DAC e USB, mantendo apenas
         // o fluxo dos clocks e dos buffers.
         constexpr float TUNER_FADE_STEP = 1.0f / (0.005f * SAMPLE_RATE);
+#endif
         const TickType_t last_usb = usb_last_callback_tick.load(std::memory_order_acquire);
         const bool usb_streaming = last_usb != 0 &&
             (xTaskGetTickCount() - last_usb < pdMS_TO_TICKS(100));
@@ -1839,6 +2300,7 @@ static void audio_processing_task(void *args) {
                 ++block_saturation_samples;
             }
             float s = fminf(fmaxf(raw_sample, -1.0f), 1.0f);
+#if !LATENCY_TEST_MODE
             if (tuner_output_gain < tuner_target_gain)
                 tuner_output_gain = fminf(tuner_target_gain, tuner_output_gain + TUNER_FADE_STEP);
             else if (tuner_output_gain > tuner_target_gain)
@@ -1853,6 +2315,18 @@ static void audio_processing_task(void *args) {
                     fminf(1.0f, (float)(elapsed_since_i2s - 100000u) / 10000.0f);
             }
             s *= tuner_output_gain * startup_gain;
+#else
+            float startup_gain = 1.0f;
+            if (startup_ramp_needed) {
+                const uint64_t sample_us = output_block_us +
+                    (uint64_t)i * 1000000u / SAMPLE_RATE;
+                const uint64_t elapsed_since_i2s = sample_us >= i2s_started_us
+                    ? sample_us - i2s_started_us : 0;
+                startup_gain = elapsed_since_i2s <= 100000u ? 0.0f :
+                    fminf(1.0f, (float)(elapsed_since_i2s - 100000u) / 10000.0f);
+            }
+            s *= startup_gain;
+#endif
             // UAC 24-in-32: os 24 bits válidos ficam alinhados à esquerda,
             // como no barramento I2S dos codecs. O fator de 24 bits evita o
             // caso +1.0 * 2147483647, que em float arredonda para 2^31.
@@ -1861,8 +2335,25 @@ static void audio_processing_task(void *args) {
             const int32_t usb_sample = out_sample;
 
             usb_block[i] = usb_sample;
+#if LATENCY_TEST_MODE
+            // Depois da rampa inicial, preserva cada bit recebido no canal L.
+            // Durante a rampa, mantém a proteção contra estalo já existente.
+            int32_t dac_left = 0;
+            if (route & AUDIO_ROUTE_DAC) {
+                if (startup_gain >= 1.0f) {
+                    dac_left = audio_buffer[i * 2];
+                } else {
+                    const float ramped = (float)audio_buffer[i * 2] *
+                        INT32_TO_FLOAT * startup_gain;
+                    dac_left = (int32_t)lrintf(ramped * 8388607.0f) * 256;
+                }
+            }
+            audio_buffer[i * 2] = dac_left;
+            audio_buffer[i * 2 + 1] = 0;
+#else
             audio_buffer[i * 2]     = (route & AUDIO_ROUTE_DAC) ? out_sample : 0;
             audio_buffer[i * 2 + 1] = (route & AUDIO_ROUTE_DAC) ? out_sample : 0;
+#endif
 
         }
 #if ENABLE_PROFILING
@@ -1883,8 +2374,8 @@ static void audio_processing_task(void *args) {
         }
         const uint32_t processing_us = (uint32_t)(esp_timer_get_time() - processing_started);
 #if ENABLE_PROFILING
-        audio_profiler.record(AP_BLOCK_TOTAL, processing_us, frames,
-                              profile_metrics::MODE_ACTIVE);
+        PROFILE_FINISH(audio_profiler, AP_BLOCK_TOTAL, profile_metrics::MODE_ACTIVE,
+                       frames, block_total_profile);
 #endif
         last_audio_block_us.store(processing_us, std::memory_order_relaxed);
         update_max(max_audio_block_us, processing_us);
@@ -1900,7 +2391,7 @@ static void audio_processing_task(void *args) {
                 slow_streak = 0;
             }
             if (shed_level >= 4) {
-#if ENABLE_CAB_SIM
+#if ENABLE_CAB_SIM && !LATENCY_TEST_MODE
                 cab_shed_latched = true;
                 cab_failsafe_bypass.store(true, std::memory_order_relaxed);
 #endif
@@ -1922,7 +2413,7 @@ static void audio_processing_task(void *args) {
         }
         dsp_quality_level.store(shed_level, std::memory_order_relaxed);
 #if ENABLE_PROFILING
-        const int64_t tx_wait_started = esp_timer_get_time();
+        PROFILE_START(tx_wait_profile);
 #endif
         const esp_err_t write_status = i2s_channel_write(
             tx_chan, audio_buffer, bytes_read, &bytes_written, 100);
@@ -1937,15 +2428,17 @@ static void audio_processing_task(void *args) {
             consecutive_io_errors = 0;
         }
 #if ENABLE_PROFILING
-        audio_profiler.record(AP_TX_WAIT,
-            (uint64_t)(esp_timer_get_time() - tx_wait_started), bytes_written / 8,
-            profile_metrics::MODE_ACTIVE);
+        PROFILE_FINISH(audio_profiler, AP_TX_WAIT, profile_metrics::MODE_ACTIVE,
+                       bytes_written / 8, tx_wait_profile);
 #endif
     }
 }
 
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Iniciando firmware; motivo do reset=%d", (int)esp_reset_reason());
+#if LATENCY_TEST_MODE
+    ESP_LOGW(TAG, "LATENCY_TEST_MODE ativo: efeitos/gate ignorados; DAC L=ADC L apos rampa, DAC R=0");
+#endif
     ESP_ERROR_CHECK(configure_task_watchdog());
 #if ENABLE_PROFILING
     uint64_t timer_calibration_start = (uint64_t)esp_timer_get_time();
@@ -1961,14 +2454,30 @@ extern "C" void app_main(void) {
     control_mutex = xSemaphoreCreateMutex();
     configASSERT(control_mutex != nullptr);
 
-    // Estado padrão inicial caso o NVS esteja vazio
-    PedalState boot_state;
-    const bool boot_loaded = PresetManager::loadPreset(0, boot_state);
-    normalize_state_for_build(boot_state);
-    if (!boot_loaded || !validPedalState(boot_state, TOTAL_IR_PRESETS)) {
-        boot_state = defaultPedalState();
+    // Restaura o som em uma chave separada dos slots de preset. Se ainda não
+    // houver retomada, mantém o comportamento antigo de iniciar pelo slot 0.
+    PedalState boot_state{};
+    uint8_t boot_slot = PRESET_SLOT_UNKNOWN;
+    bool boot_edited = false;
+    bool boot_loaded = PresetManager::loadRecovery(boot_state, boot_slot, boot_edited) &&
+                       validPedalState(boot_state, TOTAL_IR_PRESETS);
+    if (!boot_loaded) {
+        boot_loaded = PresetManager::loadPreset(0, boot_state) &&
+                      validPedalState(boot_state, TOTAL_IR_PRESETS);
+        if (boot_loaded) boot_slot = 0;
+        boot_edited = false;
     }
+    normalize_state_for_build(boot_state);
+    if (!boot_loaded) {
+        boot_state = defaultPedalState();
+        boot_slot = PRESET_SLOT_UNKNOWN;
+        boot_edited = false;
+    }
+    active_preset_slot.store(boot_slot, std::memory_order_release);
+    active_preset_edited.store(boot_edited, std::memory_order_release);
     publish_state(boot_state);
+    recovery_tracking_enabled.store(true, std::memory_order_release);
+    request_recovery_save();
 
     if (!tape_delay.begin()) ESP_LOGE(TAG, "PSRAM indisponivel: delay em bypass");
     if (!reverb.begin()) ESP_LOGE(TAG, "Memoria indisponivel: reverb em bypass");

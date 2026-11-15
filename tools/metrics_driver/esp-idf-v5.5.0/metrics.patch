@@ -1,0 +1,386 @@
+--- a/components/esp_hw_support/dma/gdma.c
++++ b/components/esp_hw_support/dma/gdma.c
+@@ -27,6 +27,9 @@
+  */
+ 
+ #include "gdma_priv.h"
++#include "DmaDriverMetrics.h"
++#include "ProfileCycleCounter.h"
++#include <string.h>
+ #include "esp_memory_utils.h"
+ #include "esp_flash_encrypt.h"
+ 
+@@ -64,6 +67,86 @@
+ static gdma_platform_t s_platform = {
+     .spinlock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED,
+ };
++
++#define GDMA_METRICS_TRACKED_CHANNELS 32
++typedef struct { gdma_channel_handle_t channel; int peripheral; int instance_id; } gdma_metrics_channel_t;
++static gdma_metrics_channel_t gdma_metrics_channels[GDMA_METRICS_TRACKED_CHANNELS];
++static DmaDriverMetrics gdma_driver_metrics = { .events_valid = 1, .timing_valid = 1 };
++static portMUX_TYPE gdma_driver_metrics_lock = portMUX_INITIALIZER_UNLOCKED;
++static bool IRAM_ATTR gdma_metrics_is_i2s0(gdma_channel_handle_t channel)
++{
++    bool matched = false;
++    portENTER_CRITICAL_ISR(&gdma_driver_metrics_lock);
++    for (size_t i = 0; i < GDMA_METRICS_TRACKED_CHANNELS; ++i) {
++        if (gdma_metrics_channels[i].channel == channel) {
++            matched = gdma_metrics_channels[i].peripheral == GDMA_TRIG_PERIPH_I2S &&
++                      gdma_metrics_channels[i].instance_id == SOC_GDMA_TRIG_PERIPH_I2S0;
++            break;
++        }
++    }
++    portEXIT_CRITICAL_ISR(&gdma_driver_metrics_lock);
++    return matched;
++}
++static void gdma_metrics_track(gdma_channel_handle_t channel, gdma_trigger_t trigger)
++{
++    if (trigger.periph != GDMA_TRIG_PERIPH_I2S || trigger.instance_id != SOC_GDMA_TRIG_PERIPH_I2S0) return;
++    portENTER_CRITICAL(&gdma_driver_metrics_lock);
++    size_t slot = GDMA_METRICS_TRACKED_CHANNELS;
++    for (size_t i = 0; i < GDMA_METRICS_TRACKED_CHANNELS; ++i) {
++        if (gdma_metrics_channels[i].channel == channel) { slot = i; break; }
++        if (!gdma_metrics_channels[i].channel && slot == GDMA_METRICS_TRACKED_CHANNELS) slot = i;
++    }
++    if (slot < GDMA_METRICS_TRACKED_CHANNELS) {
++        gdma_metrics_channels[slot].channel = channel;
++        gdma_metrics_channels[slot].peripheral = trigger.periph;
++        gdma_metrics_channels[slot].instance_id = trigger.instance_id;
++    } else gdma_driver_metrics.events_valid = 0;
++    portEXIT_CRITICAL(&gdma_driver_metrics_lock);
++}
++static void gdma_metrics_untrack(gdma_channel_handle_t channel)
++{
++    portENTER_CRITICAL(&gdma_driver_metrics_lock);
++    for (size_t i = 0; i < GDMA_METRICS_TRACKED_CHANNELS; ++i) {
++        if (gdma_metrics_channels[i].channel == channel) {
++            memset(&gdma_metrics_channels[i], 0, sizeof(gdma_metrics_channels[i]));
++            break;
++        }
++    }
++    portEXIT_CRITICAL(&gdma_driver_metrics_lock);
++}
++static void IRAM_ATTR gdma_metrics_record(bool tx, uint32_t cycles, bool same_core, bool error)
++{
++    portENTER_CRITICAL_ISR(&gdma_driver_metrics_lock);
++    uint32_t *count = tx ? &gdma_driver_metrics.tx_interrupts : &gdma_driver_metrics.rx_interrupts;
++    uint32_t *errors = tx ? &gdma_driver_metrics.tx_errors : &gdma_driver_metrics.rx_errors;
++    uint64_t *total = tx ? &gdma_driver_metrics.tx_isr_cycles_total : &gdma_driver_metrics.rx_isr_cycles_total;
++    uint32_t *maximum = tx ? &gdma_driver_metrics.tx_isr_cycles_max : &gdma_driver_metrics.rx_isr_cycles_max;
++    ++*count;
++    if (error) ++*errors;
++    if (same_core) { *total += cycles; if (cycles > *maximum) *maximum = cycles; }
++    else gdma_driver_metrics.timing_valid = 0;
++    portEXIT_CRITICAL_ISR(&gdma_driver_metrics_lock);
++}
++void gdma_driver_metrics_snapshot(DmaDriverMetrics *out)
++{
++    if (!out) return;
++    portENTER_CRITICAL(&gdma_driver_metrics_lock);
++    *out = gdma_driver_metrics;
++    portEXIT_CRITICAL(&gdma_driver_metrics_lock);
++}
++uint32_t gdma_driver_metrics_storage_bytes(void)
++{
++    return sizeof(gdma_driver_metrics) + sizeof(gdma_driver_metrics_lock) +
++           sizeof(gdma_metrics_channels);
++}
++void gdma_driver_metrics_reset(void)
++{
++    portENTER_CRITICAL(&gdma_driver_metrics_lock);
++    memset(&gdma_driver_metrics, 0, sizeof(gdma_driver_metrics));
++    gdma_driver_metrics.events_valid = 1;
++    gdma_driver_metrics.timing_valid = 1;
++    portEXIT_CRITICAL(&gdma_driver_metrics_lock);
++}
+ 
+ typedef struct {
+     int bus_id;
+@@ -300,6 +383,7 @@
+     ESP_RETURN_ON_FALSE(!periph_conflict, ESP_ERR_INVALID_STATE, TAG, "peripheral %d is already used by another channel", trig_periph.instance_id);
+     gdma_hal_connect_peri(hal, pair->pair_id, dma_chan->direction, trig_periph.periph, trig_periph.instance_id);
+     dma_chan->periph_id = trig_periph.instance_id;
++    gdma_metrics_track(dma_chan, trig_periph);
+     return ESP_OK;
+ }
+ 
+@@ -327,6 +411,7 @@
+         }
+     }
+ 
++    gdma_metrics_untrack(dma_chan);
+     gdma_hal_disconnect_peri(hal, pair->pair_id, dma_chan->direction);
+ 
+     dma_chan->periph_id = GDMA_INVALID_PERIPH_TRIG;
+@@ -773,6 +858,8 @@
+ 
+ void gdma_default_rx_isr(void *args)
+ {
++    const int metric_core_start = PROFILE_CORE_ID();
++    const uint32_t metric_cycle_start = PROFILE_CYCLE_COUNT();
+     gdma_rx_channel_t *rx_chan = (gdma_rx_channel_t *)args;
+     gdma_pair_t *pair = rx_chan->base.pair;
+     gdma_group_t *group = pair->group;
+@@ -819,6 +906,10 @@
+         need_yield |= rx_chan->cbs.on_recv_eof(&rx_chan->base, &edata, rx_chan->user_data);
+     }
+ 
++    if (gdma_metrics_is_i2s0(&rx_chan->base)) {
++        const bool error = (intr_status & (GDMA_LL_EVENT_RX_DESC_ERROR | GDMA_LL_EVENT_RX_ERR_EOF)) != 0;
++        gdma_metrics_record(false, PROFILE_CYCLE_COUNT() - metric_cycle_start, metric_core_start == PROFILE_CORE_ID(), error);
++    }
+     if (need_yield) {
+         portYIELD_FROM_ISR();
+     }
+@@ -826,6 +917,8 @@
+ 
+ void gdma_default_tx_isr(void *args)
+ {
++    const int metric_core_start = PROFILE_CORE_ID();
++    const uint32_t metric_cycle_start = PROFILE_CYCLE_COUNT();
+     gdma_tx_channel_t *tx_chan = (gdma_tx_channel_t *)args;
+     gdma_pair_t *pair = tx_chan->base.pair;
+     gdma_group_t *group = pair->group;
+@@ -846,6 +939,10 @@
+     }
+     if ((intr_status & GDMA_LL_EVENT_TX_DESC_ERROR) && tx_chan->cbs.on_descr_err) {
+         need_yield |= tx_chan->cbs.on_descr_err(&tx_chan->base, NULL, tx_chan->user_data);
++    }
++    if (gdma_metrics_is_i2s0(&tx_chan->base)) {
++        const bool error = (intr_status & GDMA_LL_EVENT_TX_DESC_ERROR) != 0;
++        gdma_metrics_record(true, PROFILE_CYCLE_COUNT() - metric_cycle_start, metric_core_start == PROFILE_CORE_ID(), error);
+     }
+     if (need_yield) {
+         portYIELD_FROM_ISR();
+--- a/components/esp_driver_i2s/i2s_common.c
++++ b/components/esp_driver_i2s/i2s_common.c
+@@ -50,6 +50,9 @@
+ #include "esp_private/gpio.h"
+ #include "driver/i2s_common.h"
+ #include "i2s_private.h"
++#include "DmaDriverMetrics.h"
++#include "ProfileCycleCounter.h"
++#include "esp_timer.h"
+ 
+ #if CONFIG_IDF_TARGET_ESP32
+ #include "esp_clock_output.h"
+@@ -76,6 +79,70 @@
+ #endif  // SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+ 
+ static const char *TAG = "i2s_common";
++
++static DmaDriverMetrics i2s_driver_metrics = { .events_valid = 1, .memory_valid = 1, .timing_valid = 1 };
++static portMUX_TYPE i2s_driver_metrics_lock = portMUX_INITIALIZER_UNLOCKED;
++static void IRAM_ATTR i2s_metrics_event(bool tx, uint32_t bytes, bool queue_error, uint32_t cycles, bool same_core)
++{
++    portENTER_CRITICAL_ISR(&i2s_driver_metrics_lock);
++    uint32_t *errors = tx ? &i2s_driver_metrics.tx_errors : &i2s_driver_metrics.rx_errors;
++    uint64_t *total = tx ? &i2s_driver_metrics.tx_callback_cycles_total : &i2s_driver_metrics.rx_callback_cycles_total;
++    uint32_t *maximum = tx ? &i2s_driver_metrics.tx_callback_cycles_max : &i2s_driver_metrics.rx_callback_cycles_max;
++    if (tx) { ++i2s_driver_metrics.tx_interrupts; i2s_driver_metrics.tx_bytes += bytes; }
++    else { ++i2s_driver_metrics.rx_interrupts; i2s_driver_metrics.rx_bytes += bytes; }
++    if (queue_error) ++*errors;
++    if (same_core) { *total += cycles; if (cycles > *maximum) *maximum = cycles; }
++    else i2s_driver_metrics.timing_valid = 0;
++    portEXIT_CRITICAL_ISR(&i2s_driver_metrics_lock);
++}
++static void i2s_metrics_memory(bool tx, bool descriptor, uint32_t bytes, bool allocate)
++{
++    portENTER_CRITICAL(&i2s_driver_metrics_lock);
++    uint32_t *value = descriptor ? (tx ? &i2s_driver_metrics.tx_descriptor_bytes : &i2s_driver_metrics.rx_descriptor_bytes) :
++                                   (tx ? &i2s_driver_metrics.tx_buffer_bytes : &i2s_driver_metrics.rx_buffer_bytes);
++    if (allocate) { if (UINT32_MAX - *value < bytes) i2s_driver_metrics.memory_valid = 0; else *value += bytes; }
++    else if (*value >= bytes) *value -= bytes;
++    else { *value = 0; i2s_driver_metrics.memory_valid = 0; }
++    portEXIT_CRITICAL(&i2s_driver_metrics_lock);
++}
++static void i2s_metrics_copy(bool tx, uint32_t cycles, bool same_core)
++{
++    portENTER_CRITICAL(&i2s_driver_metrics_lock);
++    uint64_t *total = tx ? &i2s_driver_metrics.tx_copy_cycles_total : &i2s_driver_metrics.rx_copy_cycles_total;
++    uint32_t *maximum = tx ? &i2s_driver_metrics.tx_copy_cycles_max : &i2s_driver_metrics.rx_copy_cycles_max;
++    if (same_core) { *total += cycles; if (cycles > *maximum) *maximum = cycles; }
++    else i2s_driver_metrics.timing_valid = 0;
++    portEXIT_CRITICAL(&i2s_driver_metrics_lock);
++}
++static void i2s_metrics_wait(bool tx, uint64_t elapsed_us)
++{
++    portENTER_CRITICAL(&i2s_driver_metrics_lock);
++    if (tx) i2s_driver_metrics.tx_wait_us += elapsed_us; else i2s_driver_metrics.rx_wait_us += elapsed_us;
++    portEXIT_CRITICAL(&i2s_driver_metrics_lock);
++}
++void i2s_driver_metrics_snapshot(DmaDriverMetrics *out)
++{
++    if (!out) return;
++    portENTER_CRITICAL(&i2s_driver_metrics_lock);
++    *out = i2s_driver_metrics;
++    portEXIT_CRITICAL(&i2s_driver_metrics_lock);
++}
++uint32_t i2s_driver_metrics_storage_bytes(void)
++{
++    return sizeof(i2s_driver_metrics) + sizeof(i2s_driver_metrics_lock);
++}
++void i2s_driver_metrics_reset(void)
++{
++    portENTER_CRITICAL(&i2s_driver_metrics_lock);
++    uint32_t rx_buffer = i2s_driver_metrics.rx_buffer_bytes, tx_buffer = i2s_driver_metrics.tx_buffer_bytes;
++    uint32_t rx_desc = i2s_driver_metrics.rx_descriptor_bytes, tx_desc = i2s_driver_metrics.tx_descriptor_bytes;
++    uint8_t memory_valid = i2s_driver_metrics.memory_valid;
++    memset(&i2s_driver_metrics, 0, sizeof(i2s_driver_metrics));
++    i2s_driver_metrics.rx_buffer_bytes = rx_buffer; i2s_driver_metrics.tx_buffer_bytes = tx_buffer;
++    i2s_driver_metrics.rx_descriptor_bytes = rx_desc; i2s_driver_metrics.tx_descriptor_bytes = tx_desc;
++    i2s_driver_metrics.events_valid = 1; i2s_driver_metrics.memory_valid = memory_valid; i2s_driver_metrics.timing_valid = 1;
++    portEXIT_CRITICAL(&i2s_driver_metrics_lock);
++}
+ 
+ __attribute__((always_inline))
+ inline void *i2s_dma_calloc(i2s_chan_handle_t handle, size_t num, size_t size)
+@@ -457,10 +524,13 @@
+ {
+     I2S_NULL_POINTER_CHECK(TAG, handle);
+     handle->dma.buf_size = 0;
++    const bool metric_port = handle->controller->id == I2S_NUM_0;
++    const bool metric_tx = handle->dir == I2S_DIR_TX;
+ 
+     if (handle->dma.desc) {
+         for (int i = 0; i < handle->dma.desc_num; i++) {
+             if (handle->dma.desc[i]) {
++                if (metric_port) i2s_metrics_memory(metric_tx, true, sizeof(lldesc_t), false);
+                 free(handle->dma.desc[i]);
+                 handle->dma.desc[i] = NULL;
+             }
+@@ -472,6 +542,7 @@
+     if (handle->dma.bufs) {
+         for (int i = 0; i < handle->dma.desc_num; i++) {
+             if (handle->dma.bufs[i]) {
++                if (metric_port) i2s_metrics_memory(metric_tx, false, handle->dma.buf_size, false);
+                 free(handle->dma.bufs[i]);
+                 handle->dma.bufs[i] = NULL;
+             }
+@@ -500,6 +571,7 @@
+         /* Allocate DMA descriptor */
+         handle->dma.desc[i] = (lldesc_t *) i2s_dma_calloc(handle, 1, sizeof(lldesc_t));
+         ESP_GOTO_ON_FALSE(handle->dma.desc[i], ESP_ERR_NO_MEM, err, TAG,  "allocate DMA description failed");
++        if (handle->controller->id == I2S_NUM_0) i2s_metrics_memory(handle->dir == I2S_DIR_TX, true, sizeof(lldesc_t), true);
+         handle->dma.desc[i]->owner = 1;
+         handle->dma.desc[i]->eof = 1;
+         handle->dma.desc[i]->sosf = 0;
+@@ -508,6 +580,7 @@
+         handle->dma.desc[i]->offset = 0;
+         handle->dma.bufs[i] = (uint8_t *) i2s_dma_calloc(handle, 1, bufsize * sizeof(uint8_t));
+         ESP_GOTO_ON_FALSE(handle->dma.bufs[i], ESP_ERR_NO_MEM, err, TAG,  "allocate DMA buffer failed");
++        if (handle->controller->id == I2S_NUM_0) i2s_metrics_memory(handle->dir == I2S_DIR_TX, false, bufsize, true);
+ #if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+         esp_cache_msync(handle->dma.bufs[i], bufsize * sizeof(uint8_t), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+ #endif
+@@ -581,12 +654,15 @@
+ #if SOC_GDMA_SUPPORTED
+ static bool IRAM_ATTR i2s_dma_rx_callback(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data)
+ {
++    const uint32_t metric_cycle_start = PROFILE_CYCLE_COUNT();
++    const int metric_core_start = PROFILE_CORE_ID();
+     i2s_chan_handle_t handle = (i2s_chan_handle_t)user_data;
+     BaseType_t need_yield1 = 0;
+     BaseType_t need_yield2 = 0;
+     BaseType_t user_need_yield = 0;
+     lldesc_t *finish_desc;
+     uint32_t dummy;
++    bool metric_queue_error = false;
+ 
+     finish_desc = (lldesc_t *)event_data->rx_eof_desc_addr;
+ #if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+@@ -601,6 +677,7 @@
+         user_need_yield |= handle->callbacks.on_recv(handle, &evt, handle->user_data);
+     }
+     if (xQueueIsQueueFullFromISR(handle->msg_queue)) {
++        metric_queue_error = true;
+         xQueueReceiveFromISR(handle->msg_queue, &dummy, &need_yield1);
+         if (handle->callbacks.on_recv_q_ovf) {
+             evt.data = NULL;
+@@ -608,18 +685,21 @@
+         }
+     }
+     xQueueSendFromISR(handle->msg_queue, &(finish_desc->buf), &need_yield2);
+-
++    if (handle->controller->id == I2S_NUM_0) i2s_metrics_event(false, handle->dma.buf_size, metric_queue_error, PROFILE_CYCLE_COUNT() - metric_cycle_start, metric_core_start == PROFILE_CORE_ID());
+     return need_yield1 | need_yield2 | user_need_yield;
+ }
+ 
+ static bool IRAM_ATTR i2s_dma_tx_callback(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data)
+ {
++    const uint32_t metric_cycle_start = PROFILE_CYCLE_COUNT();
++    const int metric_core_start = PROFILE_CORE_ID();
+     i2s_chan_handle_t handle = (i2s_chan_handle_t)user_data;
+     BaseType_t need_yield1 = 0;
+     BaseType_t need_yield2 = 0;
+     BaseType_t user_need_yield = 0;
+     lldesc_t *finish_desc;
+     uint32_t dummy;
++    bool metric_queue_error = false;
+ 
+     finish_desc = (lldesc_t *)event_data->tx_eof_desc_addr;
+     void *curr_buf = (void *)finish_desc->buf;
+@@ -641,6 +721,7 @@
+     }
+ #endif
+     if (xQueueIsQueueFullFromISR(handle->msg_queue)) {
++        metric_queue_error = true;
+         xQueueReceiveFromISR(handle->msg_queue, &dummy, &need_yield1);
+         if (handle->callbacks.on_send_q_ovf) {
+             evt.data = NULL;
+@@ -655,7 +736,7 @@
+ #endif
+     }
+     xQueueSendFromISR(handle->msg_queue, &(finish_desc->buf), &need_yield2);
+-
++    if (handle->controller->id == I2S_NUM_0) i2s_metrics_event(true, handle->dma.buf_size, metric_queue_error, PROFILE_CYCLE_COUNT() - metric_cycle_start, metric_core_start == PROFILE_CORE_ID());
+     return need_yield1 | need_yield2 | user_need_yield;
+ }
+ 
+@@ -1318,7 +1399,10 @@
+     src_byte = (char *)src;
+     while (size > 0 && handle->state == I2S_CHAN_STATE_RUNNING) {
+         if (handle->dma.rw_pos == handle->dma.buf_size || handle->dma.curr_ptr == NULL) {
+-            if (xQueueReceive(handle->msg_queue, &(handle->dma.curr_ptr), pdMS_TO_TICKS(timeout_ms)) == pdFALSE) {
++            const int64_t metric_wait_start = esp_timer_get_time();
++            const BaseType_t metric_queue_ready = xQueueReceive(handle->msg_queue, &(handle->dma.curr_ptr), pdMS_TO_TICKS(timeout_ms));
++            if (handle->controller->id == I2S_NUM_0) i2s_metrics_wait(true, (uint64_t)(esp_timer_get_time() - metric_wait_start));
++            if (metric_queue_ready == pdFALSE) {
+                 ret = ESP_ERR_TIMEOUT;
+                 break;
+             }
+@@ -1330,7 +1414,10 @@
+         if (bytes_can_write > size) {
+             bytes_can_write = size;
+         }
++        const uint32_t metric_copy_start = PROFILE_CYCLE_COUNT();
++        const int metric_copy_core = PROFILE_CORE_ID();
+         memcpy(data_ptr, src_byte, bytes_can_write);
++        if (handle->controller->id == I2S_NUM_0) i2s_metrics_copy(true, PROFILE_CYCLE_COUNT() - metric_copy_start, metric_copy_core == PROFILE_CORE_ID());
+ #if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+         esp_cache_msync(handle->dma.curr_ptr, handle->dma.buf_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+ #endif
+@@ -1363,7 +1450,10 @@
+     ESP_RETURN_ON_FALSE(xSemaphoreTake(handle->binary, pdMS_TO_TICKS(timeout_ms)) == pdTRUE, ESP_ERR_INVALID_STATE, TAG, "The channel is not enabled");
+     while (size > 0 && handle->state == I2S_CHAN_STATE_RUNNING) {
+         if (handle->dma.rw_pos == handle->dma.buf_size || handle->dma.curr_ptr == NULL) {
+-            if (xQueueReceive(handle->msg_queue, &(handle->dma.curr_ptr), pdMS_TO_TICKS(timeout_ms)) == pdFALSE) {
++            const int64_t metric_wait_start = esp_timer_get_time();
++            const BaseType_t metric_queue_ready = xQueueReceive(handle->msg_queue, &(handle->dma.curr_ptr), pdMS_TO_TICKS(timeout_ms));
++            if (handle->controller->id == I2S_NUM_0) i2s_metrics_wait(false, (uint64_t)(esp_timer_get_time() - metric_wait_start));
++            if (metric_queue_ready == pdFALSE) {
+                 ret = ESP_ERR_TIMEOUT;
+                 break;
+             }
+@@ -1375,7 +1465,10 @@
+         if (bytes_can_read > (int)size) {
+             bytes_can_read = size;
+         }
++        const uint32_t metric_copy_start = PROFILE_CYCLE_COUNT();
++        const int metric_copy_core = PROFILE_CORE_ID();
+         memcpy(dest_byte, data_ptr, bytes_can_read);
++        if (handle->controller->id == I2S_NUM_0) i2s_metrics_copy(false, PROFILE_CYCLE_COUNT() - metric_copy_start, metric_copy_core == PROFILE_CORE_ID());
+         size -= bytes_can_read;
+         dest_byte += bytes_can_read;
+         handle->dma.rw_pos += bytes_can_read;

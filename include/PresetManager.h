@@ -13,6 +13,7 @@ private:
     static constexpr const char* NVS_NAMESPACE = "pedal_storage";
     static constexpr uint32_t MAGIC = 0x5045444c;
     static constexpr uint16_t RECORD_VERSION = 2;
+    static constexpr uint16_t RECOVERY_VERSION = 1;
     static constexpr size_t VERSION_3_STATE_SIZE = sizeof(PedalState) + sizeof(uint8_t);
     static constexpr size_t LEGACY_STATE_SIZE = offsetof(PedalState, bitcrusher_active);
     struct __attribute__((packed)) Record {
@@ -34,6 +35,15 @@ private:
         uint16_t version;
         uint16_t length;
         uint8_t state[VERSION_3_STATE_SIZE];
+        uint32_t crc;
+    };
+    struct __attribute__((packed)) RecoveryRecord {
+        uint32_t magic;
+        uint16_t version;
+        uint16_t length;
+        PedalState state;
+        uint8_t active_slot;
+        uint8_t edited;
         uint32_t crc;
     };
     static uint32_t crc32(const uint8_t* data, size_t length) {
@@ -74,6 +84,50 @@ public:
         }
         nvs_close(handle);
         return (err == ESP_OK);
+    }
+
+    // A retomada tem uma chave e um formato próprios; nunca sobrescreve os
+    // slots de preset existentes.
+    static bool saveRecovery(const PedalState& state, uint8_t active_slot,
+                             bool edited) {
+        if (active_slot >= 16 && active_slot != 0xFF) return false;
+        nvs_handle_t handle;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) return false;
+
+        RecoveryRecord record = {
+            MAGIC, RECOVERY_VERSION,
+            static_cast<uint16_t>(sizeof(PedalState) + 2),
+            state, active_slot, static_cast<uint8_t>(edited), 0
+        };
+        record.crc = crc32(reinterpret_cast<const uint8_t*>(&record),
+                           offsetof(RecoveryRecord, crc));
+        esp_err_t err = nvs_set_blob(handle, "resume", &record, sizeof(record));
+        if (err == ESP_OK) err = nvs_commit(handle);
+        nvs_close(handle);
+        return err == ESP_OK;
+    }
+
+    static bool loadRecovery(PedalState& state, uint8_t& active_slot,
+                             bool& edited) {
+        nvs_handle_t handle;
+        if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return false;
+        size_t required_size = 0;
+        esp_err_t err = nvs_get_blob(handle, "resume", nullptr, &required_size);
+        RecoveryRecord record{};
+        if (err == ESP_OK && required_size == sizeof(record))
+            err = nvs_get_blob(handle, "resume", &record, &required_size);
+        nvs_close(handle);
+        if (err != ESP_OK || required_size != sizeof(record) ||
+            record.magic != MAGIC || record.version != RECOVERY_VERSION ||
+            record.length != sizeof(PedalState) + 2 ||
+            (record.active_slot >= 16 && record.active_slot != 0xFF) ||
+            record.edited > 1 ||
+            record.crc != crc32(reinterpret_cast<const uint8_t*>(&record),
+                                offsetof(RecoveryRecord, crc))) return false;
+        state = record.state;
+        active_slot = record.active_slot;
+        edited = record.edited != 0;
+        return true;
     }
 
     static bool loadPreset(uint8_t slot, PedalState& state) {

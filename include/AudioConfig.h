@@ -22,6 +22,12 @@
 #define ENABLE_CAB_SIM       0
 #endif
 
+// Modo temporario de passagem direta para medicao de latencia round-trip.
+// Ative com -DLATENCY_TEST_MODE=1 no ambiente PlatformIO desejado.
+#ifndef LATENCY_TEST_MODE
+#define LATENCY_TEST_MODE    0
+#endif
+
 #define USB_AUDIO_RING_FRAMES 1024
 #define USB_AUDIO_PRIME_FRAMES 192
 #define USB_AUDIO_LOW_WATER 128
